@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>本地块存储演练 · COW 克隆盘与模板盘退役</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #182033; --panel2: #1f2a44; --line: #2b3a5c;
+    --text: #e6ebf5; --muted: #8fa0c0; --accent: #4f8cff; --green: #35c48d;
+    --amber: #f0b429; --red: #ff5d6c; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 60px;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 18px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--accent);
+    text-transform: uppercase; letter-spacing: .08em; }
+  .span2 { grid-column: 1 / -1; }
+  label { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 4px; }
+  select, input, textarea, button { font: inherit; }
+  select, input[type=number], input[type=text], textarea {
+    width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  textarea { font-family: var(--mono); font-size: 12px; min-height: 90px; resize: vertical; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > div { flex: 1; min-width: 140px; }
+  button { border: 0; border-radius: 6px; padding: 9px 16px; cursor: pointer;
+    background: var(--accent); color: #fff; font-weight: 600; }
+  button.secondary { background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+  button.danger { background: var(--red); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; }
+  .b-idle { background: #33415e; color: var(--muted); }
+  .b-running { background: #27468a; color: #bcd2ff; }
+  .b-completed { background: #14492f; color: var(--green); }
+  .b-failed { background: #5a1d26; color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  code, .mono { font-family: var(--mono); }
+  .muted { color: var(--muted); }
+  .ok { color: var(--green); } .warn { color: var(--amber); } .err { color: var(--red); }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  .progress { height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+  .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+  pre.out { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px; max-height: 260px; overflow: auto; font-family: var(--mono);
+    font-size: 12px; white-space: pre-wrap; word-break: break-all; margin: 0; }
+  .flash { margin-top: 10px; font-size: 13px; min-height: 20px; }
+  .tag { font-family: var(--mono); font-size: 11px; padding: 1px 7px; border-radius: 4px;
+    background: var(--panel2); border: 1px solid var(--line); }
+  .tag.clone { color: #7ee0ff; } .tag.template { color: var(--amber); }
+  .tag.zero_discard, .tag.zero_unmapped { color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; max-height: 110px; overflow: auto; }
+  .chip { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px;
+    background: var(--panel2); border: 1px solid var(--line); cursor: pointer; }
+  .chip.discard { border-color: #5a1d26; color: var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <h1>本地块存储演练</h1>
+  <span class="sub">只读模板盘 + 两个写时复制（COW）克隆盘 · 块大小 4 KiB · 内容寻址数据卷</span>
+  <span style="flex:1"></span>
+  <span id="ret-badge" class="badge b-idle">退役状态：未知</span>
+</header>
+
+<main>
+  <!-- 卷状态 -->
+  <section class="panel span2">
+    <h2>数据卷状态</h2>
+    <div id="vol-status" class="kv"><div class="k">加载中…</div></div>
+  </section>
+
+  <!-- 块操作 -->
+  <section class="panel">
+    <h2>块操作（按块号读取 / 覆盖 / 丢弃）</h2>
+    <div class="row">
+      <div>
+        <label>克隆盘</label>
+        <select id="clone">
+          <option value="clone-a">clone-a（克隆盘 A）</option>
+          <option value="clone-b">clone-b（克隆盘 B）</option>
+        </select>
+      </div>
+      <div>
+        <label>块号（block_no）</label>
+        <input type="number" id="block-no" value="0" min="0" />
+      </div>
+      <div style="flex:0">
+        <button id="btn-read">读取</button>
+      </div>
+    </div>
+
+    <label>覆盖写入内容（三选一）</label>
+    <div class="row">
+      <div>
+        <label style="margin-top:0">填充模式</label>
+        <select id="pattern">
+          <option value="">— 使用下方自定义数据 —</option>
+          <option value="zero">全零 zero</option>
+          <option value="ones">全 0xFF ones</option>
+          <option value="HELLO-CLONE-A-4K">ASCII 串（自动重复填满 4 KiB）</option>
+        </select>
+      </div>
+      <div style="flex:2">
+        <label style="margin-top:0">自定义 HEX（留空则用填充模式，须恰好 8192 个 hex 字符）</label>
+        <input type="text" id="hex-input" placeholder="例如 deadbeef...（长度 8192）" />
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="btn-write">覆盖写入</button>
+      <button id="btn-discard" class="danger">丢弃（读零）</button>
+      <span class="muted" style="align-self:center">改动只影响所选克隆盘，元数据落盘后才返回成功</span>
+    </div>
+    <div id="op-flash" class="flash"></div>
+  </section>
+
+  <!-- 读取结果 -->
+  <section class="panel">
+    <h2>读取结果</h2>
+    <div id="read-meta" class="kv muted">尚未读取</div>
+    <label style="margin-top:10px">数据（HEX，前 256 字节）</label>
+    <pre id="read-hex" class="out">—</pre>
+  </section>
+
+  <!-- 退役控制 -->
+  <section class="panel span2">
+    <h2>模板盘退役（后台执行，可中断续跑）</h2>
+    <div class="row">
+      <div style="flex:0">
+        <button id="btn-retire">开始 / 继续退役</button>
+      </div>
+      <div style="flex:0">
+        <button id="btn-refresh" class="secondary">刷新状态</button>
+      </div>
+      <div style="align-self:center">
+        <span class="muted">流程：逐块物化引用 → 删除模板索引 → 清理无引用块 → 完成</span>
+      </div>
+    </div>
+    <div id="ret-progress-wrap" style="display:none">
+      <div class="progress"><div id="ret-progress"></div></div>
+    </div>
+    <div id="ret-detail" class="kv" style="margin-top:8px"></div>
+    <div id="ret-flash" class="flash"></div>
+  </section>
+
+  <!-- 克隆盘映射 -->
+  <section class="panel">
+    <h2>clone-a 改动映射</h2>
+    <div id="map-a"></div>
+  </section>
+  <section class="panel">
+    <h2>clone-b 改动映射</h2>
+    <div id="map-b"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let snapshot = null;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+  return body;
+}
+
+function retBadge(st) {
+  const el = $("ret-badge");
+  const map = {
+    idle: ["退役状态：未开始", "b-idle"],
+    materializing: ["退役中：物化模板块引用", "b-running"],
+    index_removed: ["退役中：移除模板索引", "b-running"],
+    gc_sweep: ["退役中：清理无引用块", "b-running"],
+    completed: ["退役完成", "b-completed"],
+    failed: ["退役失败（两盘照常使用，可重试）", "b-failed"],
+  };
+  const [txt, cls] = map[st] || ["退役状态：" + st, "b-idle"];
+  el.textContent = txt;
+  el.className = "badge " + cls;
+}
+
+function renderVol(s) {
+  const t = s.template;
+  const rows = [
+    ["块大小 / 块数", `${s.block_size} B × ${s.block_count}`],
+    ["模板索引", t.index_present
+      ? `<span class="ok">存在</span>（${t.blocks} 块，只读）`
+      : `<span class="warn">已移除</span>`],
+    ["store 文件数（物理块）", `${s.store.files_on_disk} 个，去重节省 ${s.store.deduplicated_bytes} B`],
+    ["逻辑块引用 / 不同物理块", `${s.store.logical_block_refs} 次引用 → ${s.store.distinct_referenced} 个不同块（仍被引用的模板块只存一份）`],
+    ["无引用文件", s.store.unreferenced_files.length
+      ? `<span class="err">${s.store.unreferenced_files.length} 个（退役 GC 后应为 0）</span>`
+      : `<span class="ok">0 个</span>`],
+  ];
+  $("vol-status").innerHTML = rows.map(([k, v]) =>
+    `<div class="k">${k}</div><div class="mono">${v}</div>`).join("");
+
+  for (const [suffix, name] of [["a","clone-a"], ["b","clone-b"]]) {
+    const c = s.clones.find(x => x.name === name);
+    const ow = c.overwrites.map(n =>
+      `<span class="chip" data-no="${n}" title="覆盖块 ${n}">${n}</span>`).join("");
+    const dd = c.discards.map(n =>
+      `<span class="chip discard" data-no="${n}" title="丢弃块 ${n}（读零）">${n}✕</span>`).join("");
+    $("map-" + suffix).innerHTML = `
+      <div class="muted" style="margin-bottom:6px">改动块 ${c.changed_blocks} 个
+        （覆盖 ${c.overwrites.length} · 丢弃 ${c.discards.length}），点击块号可直接读取</div>
+      <div class="chips">${ow}${dd || '<span class="muted">无改动（全部经模板索引读取）</span>'}</div>`;
+  }
+  document.querySelectorAll(".chip").forEach(ch => {
+    ch.onclick = () => {
+      $("block-no").value = ch.dataset.no;
+      doRead();
+    };
+  });
+}
+
+function renderRetirement(st) {
+  const r = st.retirement;
+  retBadge(r.state || "idle");
+  if (!r || r.state === "idle") {
+    $("ret-detail").innerHTML = `<div class="k">状态</div><div>未开始退役</div>`;
+    $("ret-progress-wrap").style.display = "none";
+    return;
+  }
+  const rows = [
+    ["状态", r.state],
+    ["当前阶段", r.phase || "-"],
+  ];
+  if (r.state === "materializing") {
+    const total = st.block_count;
+    const cur = r.materialize_cursor || 0;
+    const pct = Math.round(cur / total * 100);
+    $("ret-progress-wrap").style.display = "";
+    $("ret-progress").style.width = pct + "%";
+    rows.push(["物化进度", `${cur}/${total} 块（${pct}%），已完成盘：${(r.clones_materialized||[]).join(", ") || "无"}`]);
+  } else {
+    $("ret-progress-wrap").style.display = "none";
+  }
+  if (r.index_removed !== undefined) rows.push(["模板索引", r.index_removed ? '<span class="warn">已删除</span>' : "保留中"]);
+  if (r.gc_deleted) rows.push(["GC 已删除块", `${r.gc_deleted.length} 个`]);
+  if (r.error) rows.push(["<span class='err'>失败原因</span>", `<span class="err mono">${esc(r.error)}</span>`]);
+  if (r.completed_at) rows.push(["完成时间", new Date(r.completed_at * 1000).toLocaleString()]);
+  $("ret-detail").innerHTML = rows.map(([k, v]) =>
+    `<div class="k">${k}</div><div>${v}</div>`).join("");
+  $("ret-flash").innerHTML = r.state === "completed"
+    ? `<span class="ok">✔ 索引已移除、无引用块已清理，退役完成。两盘独立保留各自最新内容。</span>`
+    : r.state === "failed"
+      ? `<span class="err">✖ ${esc(r.error) || "退役失败"}</span>` : "";
+}
+
+async function refresh() {
+  try {
+    snapshot = await api("/api/status");
+    renderVol(snapshot);
+    renderRetirement(snapshot);
+    const maxNo = snapshot.block_count - 1;
+    $("block-no").max = maxNo;
+  } catch (e) {
+    $("vol-status").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
+
+function flash(el, msg, ok) {
+  el.innerHTML = `<span class="${ok ? "ok" : "err"}">${esc(msg)}</span>`;
+}
+
+async function doRead() {
+  const name = $("clone").value, no = parseInt($("block-no").value, 10);
+  try {
+    const r = await api(`/api/clones/${name}/blocks/${no}`);
+    const sourceText = {
+      clone: "克隆盘自有块（覆盖写入）",
+      template: "模板索引（未改动块）",
+      zero_discard: "零（该块已被丢弃）",
+      zero_unmapped: "零（无映射）",
+    }[r.source];
+    $("read-meta").innerHTML = [
+      ["来源", `<span class="tag ${r.source}">${r.source}</span> ${sourceText}`],
+      ["引用", r.ref || "—"],
+      ["sha256", r.sha256],
+      ["ASCII 预览", esc(r.preview_ascii)],
+    ].map(([k, v]) => `<div class="k">${k}</div><div class="mono">${v}</div>`).join("");
+    $("read-hex").textContent = r.data_hex.slice(0, 512) + (r.data_hex.length > 512 ? " …（截断）" : "");
+  } catch (e) { flash($("op-flash"), "读取失败：" + e.message, false); }
+}
+
+async function doWrite() {
+  const name = $("clone").value, no = parseInt($("block-no").value, 10);
+  const hex = $("hex-input").value.trim();
+  const pattern = $("pattern").value;
+  const body = hex ? {data_hex: hex} : (pattern ? {pattern} : null);
+  if (!body) return flash($("op-flash"), "请填写 HEX 或选择填充模式", false);
+  try {
+    const r = await api(`/api/clones/${name}/blocks/${no}`, {
+      method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    flash($("op-flash"), `覆盖成功：${name} 块 ${r.block_no} → ${r.hash.slice(0,16)}…`, true);
+    await refresh(); doRead();
+  } catch (e) { flash($("op-flash"), "覆盖失败：" + e.message, false); }
+}
+
+async function doDiscard() {
+  const name = $("clone").value, no = parseInt($("block-no").value, 10);
+  if (!confirm(`确认丢弃 ${name} 的块 ${no}？丢弃后读取返回全零。`)) return;
+  try {
+    await api(`/api/clones/${name}/blocks/${no}`, {method: "DELETE"});
+    flash($("op-flash"), `已丢弃：${name} 块 ${no} 现在读零`, true);
+    await refresh(); doRead();
+  } catch (e) { flash($("op-flash"), "丢弃失败：" + e.message, false); }
+}
+
+$("btn-read").onclick = doRead;
+$("btn-write").onclick = doWrite;
+$("btn-discard").onclick = doDiscard;
+$("btn-refresh").onclick = refresh;
+$("btn-retire").onclick = async () => {
+  try {
+    const r = await api("/api/retirement/start", {method: "POST"});
+    $("ret-flash").innerHTML = r.started
+      ? `<span class="ok">退役已在后台启动</span>`
+      : `<span class="muted">${esc(r.message || "")}</span>`;
+  } catch (e) { flash($("ret-flash"), "启动失败：" + e.message, false); }
+  refresh();
+};
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

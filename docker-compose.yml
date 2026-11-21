@@ -1,0 +1,21 @@
+services:
+  blockstore:
+    build: .
+    image: local-blockstore-drill:latest
+    container_name: blockstore-drill
+    ports:
+      - "8000:8000"
+    environment:
+      # 数据卷内每个盘的 4 KiB 块数量（模板盘与克隆盘容量一致）
+      BLOCK_COUNT: "32"
+      TEMPLATE_SEED: "template-disk-v1"
+      # 退役物化每批处理的块数（调小可更细致观察后台进度）
+      RETIRE_BATCH_SIZE: "8"
+      # 故障演练用：设为 before_index_remove 或 before_gc_delete 可模拟退役失败
+      # FAILPOINT: "before_gc_delete"
+    volumes:
+      - blockstore-data:/data
+    restart: unless-stopped
+
+volumes:
+  blockstore-data:
