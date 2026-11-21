@@ -335,3 +335,349 @@ def test_failure_before_index_removal_keeps_index(tmp_path):
     svc2.start_retirement()
     wait_phase(svc2, PHASE_COMPLETED)
     assert not svc2.template_index_path.exists()
+
+
+# --------------------------------------------------------------------- resize
+from app.storage import (  # noqa: E402
+    MAX_BLOCK_COUNT, MIN_BLOCK_COUNT, ResizeBlockedError,
+)
+
+
+def zero_tail(svc, name, start, end=BLOCK_COUNT):
+    """Explicitly zero every block in [start, end) so it may be truncated."""
+    for no in range(start, end):
+        svc.overwrite_block(name, no, b"\x00" * BLOCK_SIZE)
+
+
+def test_grow_reads_zero_and_creates_no_files(svc):
+    files_before = {p.name for p in svc.store_dir.iterdir() if p.is_file()}
+    res = svc.resize_clone("clone-a", BLOCK_COUNT + 4)
+    assert res["changed"] is True
+    assert res["block_count"] == BLOCK_COUNT + 4
+    assert res["old_block_count"] == BLOCK_COUNT
+    assert svc.clones["clone-a"].block_count == BLOCK_COUNT + 4
+    # The other clone keeps its capacity.
+    assert svc.clones["clone-b"].block_count == BLOCK_COUNT
+    # Expanded blocks read zero and have no mapping at all.
+    for no in range(BLOCK_COUNT, BLOCK_COUNT + 4):
+        r = svc.read_block("clone-a", no)
+        assert r.data == b"\x00" * BLOCK_SIZE
+        assert r.source == "zero_unmapped"
+        assert no not in svc.clones["clone-a"].blocks
+    # Growing never materializes empty blocks into the store.
+    assert {p.name for p in svc.store_dir.iterdir() if p.is_file()} == files_before
+    # clone-b still rejects the new block numbers.
+    with pytest.raises(StorageError):
+        svc.read_block("clone-b", BLOCK_COUNT)
+
+
+def test_grow_then_write_roundtrip(svc):
+    target = BLOCK_COUNT + 2
+    svc.resize_clone("clone-a", target)
+    payload = fill(b"NEW-BLOCK")
+    svc.overwrite_block("clone-a", BLOCK_COUNT + 1, payload)
+    assert svc.read_block("clone-a", BLOCK_COUNT + 1).data == payload
+    # Persisted across a restart.
+    svc2 = BlockService(svc.data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.clones["clone-a"].block_count == target
+    assert svc2.read_block("clone-a", BLOCK_COUNT + 1).data == payload
+    assert svc2.clones["clone-b"].block_count == BLOCK_COUNT
+
+
+def test_shrink_truncates_zero_tail(svc):
+    svc.overwrite_block("clone-a", 1, fill(b"KEEP"))
+    zero_tail(svc, "clone-a", 4)
+    res = svc.resize_clone("clone-a", 4)
+    assert res["block_count"] == 4
+    assert svc.read_block("clone-a", 1).data == fill(b"KEEP")
+    with pytest.raises(StorageError):
+        svc.read_block("clone-a", 4)
+    with pytest.raises(StorageError):
+        svc.overwrite_block("clone-a", 5, fill(b"NOPE"))
+    with pytest.raises(StorageError):
+        svc.discard_block("clone-a", 5)
+    # Other clone untouched.
+    assert svc.clones["clone-b"].block_count == BLOCK_COUNT
+    assert svc.read_block("clone-b", 7).source == "template"
+
+
+def test_shrink_rejected_on_first_nonzero_block(svc):
+    svc.overwrite_block("clone-a", 4, b"\x00" * BLOCK_SIZE)
+    svc.overwrite_block("clone-a", 6, fill(b"DIRTY"))
+    svc.overwrite_block("clone-a", 5, fill(b"ALSO-DIRTY"))
+    with pytest.raises(ResizeBlockedError) as ei:
+        svc.resize_clone("clone-a", 4)
+    # Block 4 is now zero, so the first offending block is 5.
+    assert ei.value.block_no == 5
+    assert ei.value.target_count == 4
+    # Nothing changed: capacity, data and metadata all intact.
+    assert svc.clones["clone-a"].block_count == BLOCK_COUNT
+    assert svc.read_block("clone-a", 5).data == fill(b"ALSO-DIRTY")
+    assert svc.read_block("clone-a", 7).source == "template"
+    svc2 = BlockService(svc.data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.clones["clone-a"].block_count == BLOCK_COUNT
+    assert svc2.read_block("clone-a", 6).data == fill(b"DIRTY")
+
+
+def test_shrink_rejects_nonzero_unmodified_template_tail(svc):
+    # Unmodified blocks resolve to non-zero template content: refuse, naming
+    # the first (lowest) non-zero block in the truncated tail.
+    with pytest.raises(ResizeBlockedError) as ei:
+        svc.resize_clone("clone-a", BLOCK_COUNT - 1)
+    assert ei.value.block_no == BLOCK_COUNT - 1
+    assert svc.clones["clone-a"].block_count == BLOCK_COUNT
+
+
+def test_shrink_allows_discarded_tail(svc):
+    # A discard reads zero, so it may be truncated away.
+    svc.discard_block("clone-a", 7)
+    svc.resize_clone("clone-a", 7)
+    assert svc.clones["clone-a"].block_count == 7
+    with pytest.raises(StorageError):
+        svc.read_block("clone-a", 7)
+
+
+def test_regrow_after_shrink_reads_zero_not_template(svc):
+    # Block 5 is a template-backed block. Shrinking past it requires zeroing
+    # it first; growing it back must keep reading zero, not template content.
+    svc.overwrite_block("clone-a", 5, b"\x00" * BLOCK_SIZE)
+    zero_tail(svc, "clone-a", 6)
+    svc.resize_clone("clone-a", 5)
+    svc.resize_clone("clone-a", BLOCK_COUNT + 1)
+    r = svc.read_block("clone-a", 5)
+    assert r.data == b"\x00" * BLOCK_SIZE
+    assert r.source == "zero_unmapped"
+    # Blocks never truncated still read through the template.
+    assert svc.read_block("clone-a", 4).source == "template"
+    # Survives a restart.
+    svc2 = BlockService(svc.data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.read_block("clone-a", 5).source == "zero_unmapped"
+    assert svc2.read_block("clone-a", 4).source == "template"
+
+
+def test_regrow_hole_never_filled_by_retirement_materialization(tmp_path):
+    data_dir = tmp_path / "data"
+    svc = BlockService(data_dir, BLOCK_COUNT)
+    svc.step_delay = 0.02
+    svc.initialize()
+    # Zero out and shrink away blocks 6..7, then grow the capacity back.
+    zero_tail(svc, "clone-a", 6)
+    svc.resize_clone("clone-a", 6)
+    svc.resize_clone("clone-a", BLOCK_COUNT)
+    svc.start_retirement()
+    wait_phase(svc, PHASE_COMPLETED)
+    for no in (6, 7):
+        r = svc.read_block("clone-a", no)
+        assert r.source == "zero_unmapped", f"block {no} materialized: {r.source}"
+        assert r.data == b"\x00" * BLOCK_SIZE
+    # clone-b never truncated them, so retirement materialized them there.
+    assert svc.read_block("clone-b", 6).source == "clone"
+
+
+def test_truncated_blocks_do_not_block_retirement(tmp_path):
+    data_dir = tmp_path / "data"
+    svc = BlockService(data_dir, BLOCK_COUNT)
+    svc.step_delay = 0.05
+    svc.initialize()
+    zero_tail(svc, "clone-a", 4)
+    svc.resize_clone("clone-a", 4)
+    svc.start_retirement()  # runs while clone-a has a smaller capacity
+    st = wait_phase(svc, PHASE_COMPLETED)
+    assert st["state"] == PHASE_COMPLETED
+    assert not svc.template_index_path.exists()
+    assert svc.clones["clone-a"].block_count == 4
+    assert svc.snapshot()["store"]["unreferenced_files"] == []
+
+
+def test_resize_during_retirement(tmp_path):
+    data_dir = tmp_path / "data"
+    svc = BlockService(data_dir, BLOCK_COUNT)
+    svc.step_delay = 0.05
+    svc.initialize()
+    zero_tail(svc, "clone-b", 6)
+    svc.start_retirement()
+    # Shrink while materialization is in flight, then grow back.
+    svc.resize_clone("clone-b", 6)
+    svc.resize_clone("clone-b", BLOCK_COUNT + 2)
+    wait_phase(svc, PHASE_COMPLETED)
+    for no in (6, 7):
+        r = svc.read_block("clone-b", no)
+        assert r.source == "zero_unmapped"
+        assert r.data == b"\x00" * BLOCK_SIZE
+    assert svc.clones["clone-b"].block_count == BLOCK_COUNT + 2
+    assert svc.read_block("clone-b", BLOCK_COUNT + 1).source == "zero_unmapped"
+
+
+def test_resize_bounds(svc):
+    for bad in (0, -1, MAX_BLOCK_COUNT + 1):
+        with pytest.raises(StorageError):
+            svc.resize_clone("clone-a", bad)
+    with pytest.raises(StorageError):
+        svc.resize_clone("clone-a", True)
+    with pytest.raises(StorageError):
+        svc.resize_clone("ghost", 4)
+    assert svc.clones["clone-a"].block_count == BLOCK_COUNT
+    # Both range endpoints are accepted (tail is zero after shrinking to 1 only
+    # if we zero it, so zero everything first).
+    zero_tail(svc, "clone-a", 0)
+    svc.resize_clone("clone-a", MIN_BLOCK_COUNT)
+    assert svc.clones["clone-a"].block_count == MIN_BLOCK_COUNT
+    svc.resize_clone("clone-a", MAX_BLOCK_COUNT)
+    assert svc.clones["clone-a"].block_count == MAX_BLOCK_COUNT
+
+
+def test_resize_is_single_clone_and_durable(tmp_path):
+    data_dir = tmp_path / "data"
+    svc = BlockService(data_dir, BLOCK_COUNT)
+    svc.initialize()
+    svc.overwrite_block("clone-b", 0, fill(b"B0"))
+    zero_tail(svc, "clone-a", 3)
+    svc.resize_clone("clone-a", 3)
+    # clone-b unchanged in capacity and content.
+    assert svc.clones["clone-b"].block_count == BLOCK_COUNT
+    assert svc.read_block("clone-b", 0).data == fill(b"B0")
+    svc.stop_worker()
+
+    svc2 = BlockService(data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.clones["clone-a"].block_count == 3
+    assert svc2.clones["clone-b"].block_count == BLOCK_COUNT
+    assert svc2.read_block("clone-b", 0).data == fill(b"B0")
+
+
+def test_resize_failure_keeps_old_capacity_and_data(svc, monkeypatch):
+    svc.overwrite_block("clone-a", 1, fill(b"SAFE"))
+    zero_tail(svc, "clone-a", 2)
+
+    def boom(path, obj):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("app.storage._atomic_write_json", boom)
+    with pytest.raises(OSError):
+        svc.resize_clone("clone-a", 2)
+    monkeypatch.undo()
+    # In-memory state still reports the old capacity and data.
+    assert svc.clones["clone-a"].block_count == BLOCK_COUNT
+    assert svc.read_block("clone-a", 1).data == fill(b"SAFE")
+    assert svc.read_block("clone-a", 7).data == b"\x00" * BLOCK_SIZE
+    assert svc.read_block("clone-a", 7).source == "clone"
+    # On disk too.
+    doc = json.loads((svc.clones_dir / "clone-a.json").read_text())
+    assert doc["block_count"] == BLOCK_COUNT
+    assert len(doc["blocks"]) == BLOCK_COUNT - 1  # zeroed tail mappings retained
+
+
+def test_grow_failure_keeps_old_capacity(svc, monkeypatch):
+    svc.overwrite_block("clone-a", 0, fill(b"KEEP-A0"))
+
+    def boom(path, obj):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("app.storage._atomic_write_json", boom)
+    with pytest.raises(OSError):
+        svc.resize_clone("clone-a", BLOCK_COUNT + 4)
+    monkeypatch.undo()
+    assert svc.clones["clone-a"].block_count == BLOCK_COUNT
+    with pytest.raises(StorageError):
+        svc.read_block("clone-a", BLOCK_COUNT)
+    assert svc.read_block("clone-a", 0).data == fill(b"KEEP-A0")
+
+
+def test_concurrent_write_cannot_slip_between_tail_check_and_shrink(svc, monkeypatch):
+    """Every interleaving must leave a consistent outcome.
+
+    A writer racing a shrink either commits before the emptiness check (the
+    shrink is then refused) or after the new capacity is in effect (the write
+    is refused).  There is no window in which a tail write is accepted and
+    then silently truncated away.
+    """
+    import threading
+    start = threading.Barrier(2)
+    outcome = {}
+    original = svc._logical_hash_locked
+
+    def slow_check(clone, block_no):
+        # Widen the would-be race window right at the emptiness check.
+        result = original(clone, block_no)
+        if block_no == 6:
+            time.sleep(0.005)
+        return result
+
+    monkeypatch.setattr(svc, "_logical_hash_locked", slow_check)
+
+    def writer():
+        start.wait()
+        try:
+            svc.overwrite_block("clone-a", 6, fill(b"RACED"))
+            outcome["write"] = "ok"
+        except StorageError:
+            outcome["write"] = "rejected"
+
+    def resizer():
+        start.wait()
+        try:
+            # Zero blocks 6 and 7 first so the only obstacle can be the
+            # racing writer's data in block 6.
+            svc.resize_clone("clone-a", 6)
+            outcome["resize"] = "ok"
+        except ResizeBlockedError:
+            outcome["resize"] = "rejected"
+
+    t1 = threading.Thread(target=writer)
+    t2 = threading.Thread(target=resizer)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    if outcome["write"] == "ok":
+        # The write won: it must still be readable iff the shrink was refused.
+        if outcome["resize"] == "ok":
+            raise AssertionError("write accepted and tail silently truncated")
+        assert svc.clones["clone-a"].block_count == BLOCK_COUNT
+        assert svc.read_block("clone-a", 6).data == fill(b"RACED")
+    else:
+        # The shrink won: capacity is smaller and block 6 is unreachable.
+        assert outcome["resize"] == "ok"
+        assert svc.clones["clone-a"].block_count == 6
+        with pytest.raises(StorageError):
+            svc.read_block("clone-a", 6)
+    # Whatever the order, on-disk metadata agrees with memory.
+    doc = json.loads((svc.clones_dir / "clone-a.json").read_text())
+    assert doc["block_count"] == svc.clones["clone-a"].block_count
+
+
+def test_concurrent_reads_respect_resize(svc):
+    """Reads either see the old capacity or are rejected; never a torn state."""
+    import threading
+    errors = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                r = svc.read_block("clone-a", 7)
+                assert len(r.data) == BLOCK_SIZE
+            except StorageError:
+                pass  # out of range after shrink
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                return
+
+    # Zero the tail once so the shrink is legal; reads racing the resize must
+    # still see a consistent capacity.
+    zero_tail(svc, "clone-a", 4)
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    try:
+        for _ in range(5):
+            svc.resize_clone("clone-a", BLOCK_COUNT)
+            svc.resize_clone("clone-a", 4)
+            svc.resize_clone("clone-a", BLOCK_COUNT)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()
+    assert not errors, errors
+    assert svc.clones["clone-a"].block_count == BLOCK_COUNT

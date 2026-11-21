@@ -4,12 +4,14 @@ On-disk layout (``DATA_DIR``, mounted as a Docker volume)::
 
     template/index.json        # block_no -> sha256, immutable until retirement
     store/<sha256>             # content-addressed 4 KiB blocks (dedup store)
-    clones/<name>.json         # clone metadata (overwrites + discards)
+    clones/<name>.json         # per-clone capacity + overwrites/discards
     retirement.json            # durable retirement state machine
 
 Every mutation is persisted with a temp-file + fsync + atomic rename before the
-API call returns, so a process crash can never lose a confirmed overwrite or
-discard, and an interrupted retirement simply resumes on the next startup.
+API call returns, so a process crash can never lose a confirmed overwrite,
+discard or capacity change, and an interrupted retirement simply resumes on the
+next startup.  A clone's capacity and its block mapping live in the same
+atomic metadata document, so a failed resize keeps the old capacity and data.
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ BLOCK_SIZE = 4096
 ZEROS = b"\x00" * BLOCK_SIZE
 ZERO_HASH = hashlib.sha256(ZEROS).hexdigest()
 CLONE_NAMES = ("clone-a", "clone-b")
+MIN_BLOCK_COUNT = 1
+MAX_BLOCK_COUNT = 32768
 
 # Retirement state machine phases.
 PHASE_MATERIALIZING = "materializing"   # copy template refs into each clone
@@ -88,35 +92,72 @@ class StorageError(Exception):
     pass
 
 
-class Clone:
-    """A COW clone. Metadata layout (version 1)::
+class ResizeBlockedError(StorageError):
+    """A shrink was refused because the truncated tail is not all zero."""
 
-        {"name": ..., "block_count": N,
+    def __init__(self, clone_name: str, target_count: int, block_no: int):
+        self.clone_name = clone_name
+        self.target_count = target_count
+        self.block_no = block_no
+        super().__init__(
+            f"cannot shrink {clone_name} to {target_count} blocks: "
+            f"block {block_no} is not zero "
+            f"(first nonzero block in the truncated tail)"
+        )
+
+
+class Clone:
+    """A COW clone. Metadata layout (version 2)::
+
+        {"name": ..., "block_count": N, "template_limit": T,
          "blocks": {"<no>": {"kind": "data"|"zero", "hash": ...}}}
+
+    ``template_limit`` is the exclusive upper bound of block numbers that may
+    still resolve through the template index.  It starts at the clone's
+    initial capacity and only ever shrinks: once a block has been truncated
+    away it must read zero even if the same number is later re-added and the
+    template index still knows about it.
     """
 
     def __init__(self, path: Path, name: str, block_count: int):
         self.path = path
         self.name = name
         self.block_count = block_count
+        self.template_limit = block_count
         self.lock = threading.RLock()
         self.blocks: dict[int, dict[str, Any]] = {}
         if path.exists():
             doc = json.loads(path.read_text("utf-8"))
             self.block_count = doc["block_count"]
+            # Volumes written before resizing existed have no template_limit:
+            # every block they know about still reads through the template.
+            self.template_limit = doc.get("template_limit", self.block_count)
+            self.template_limit = min(int(self.template_limit), self.block_count)
             self.blocks = {int(k): v for k, v in doc["blocks"].items()}
 
     def _persist(self) -> None:
+        self._persist_state(self.block_count, self.blocks, self.template_limit)
+
+    def _persist_state(self, block_count: int, blocks: dict[int, dict[str, Any]],
+                       template_limit: int) -> None:
+        """Durably write a candidate capacity+mapping in one atomic step.
+
+        The in-memory state is deliberately left untouched by this helper: a
+        failed resize must keep the old capacity and data visible, so callers
+        only assign the new values after this returns successfully.
+        """
         doc = {
-            "version": 1,
+            "version": 2,
             "name": self.name,
-            "block_count": self.block_count,
-            "blocks": {str(k): v for k, v in sorted(self.blocks.items())},
+            "block_count": block_count,
+            "template_limit": template_limit,
+            "blocks": {str(k): v for k, v in sorted(blocks.items())},
         }
         _atomic_write_json(self.path, doc)
 
     def validate_block_no(self, block_no: int) -> None:
-        if not isinstance(block_no, int) or block_no < 0 or block_no >= self.block_count:
+        if not isinstance(block_no, int) or isinstance(block_no, bool) or \
+                block_no < 0 or block_no >= self.block_count:
             raise StorageError(
                 f"block_no must be an integer in [0, {self.block_count - 1}], got {block_no!r}"
             )
@@ -235,8 +276,12 @@ class BlockService:
     # ------------------------------------------------------------------ reads
     def read_block(self, clone_name: str, block_no: int) -> BlockRead:
         clone = self._get_clone(clone_name)
-        clone.validate_block_no(block_no)
+        # Capacity is validated while holding the clone lock, i.e. against the
+        # capacity in effect when this read takes effect.  A concurrent shrink
+        # therefore either happens entirely before (read rejected) or after
+        # (read served from the old capacity).
         with clone.lock:
+            clone.validate_block_no(block_no)
             entry = clone.blocks.get(block_no)
             if entry is not None:
                 if entry["kind"] == "zero":
@@ -246,8 +291,10 @@ class BlockService:
                 data = self._store_path(h).read_bytes()
                 return BlockRead(data, "clone", h, f"clone:{block_no}")
 
-            # Unmapped: fall back to the template index while it still exists.
-            if self.template_index is not None and block_no in self.template_index:
+            # Unmapped: fall back to the template index while it still exists
+            # AND this block number was never truncated away by a shrink.
+            if (self.template_index is not None and block_no in self.template_index
+                    and block_no < clone.template_limit):
                 h = self.template_index[block_no]
                 data = self._store_path(h).read_bytes()
                 return BlockRead(data, "template", h, f"template:{block_no}")
@@ -275,9 +322,13 @@ class BlockService:
         if len(data) != BLOCK_SIZE:
             raise StorageError(f"block data must be exactly {BLOCK_SIZE} bytes, got {len(data)}")
         clone = self._get_clone(clone_name)
-        clone.validate_block_no(block_no)
         with self.global_lock:
             with clone.lock:
+                # Validate against the capacity in effect for this write.  The
+                # global lock also orders this write against a concurrent
+                # shrink, so no overwrite can land in a tail that was just
+                # proven all-zero and truncated.
+                clone.validate_block_no(block_no)
                 old = clone.blocks.get(block_no)
                 h = self._store_put(data)
                 clone.blocks[block_no] = {"kind": "data", "hash": h}
@@ -290,9 +341,9 @@ class BlockService:
 
     def discard_block(self, clone_name: str, block_no: int) -> dict[str, Any]:
         clone = self._get_clone(clone_name)
-        clone.validate_block_no(block_no)
         with self.global_lock:
             with clone.lock:
+                clone.validate_block_no(block_no)
                 old = clone.blocks.get(block_no)
                 clone.blocks[block_no] = {"kind": "zero", "hash": ZERO_HASH}
                 clone._persist()
@@ -305,6 +356,89 @@ class BlockService:
             return self.clones[name]
         except KeyError:
             raise StorageError(f"unknown clone {name!r}; expected one of {CLONE_NAMES}")
+
+    # ------------------------------------------------------------------ resize
+    def _logical_hash_locked(self, clone: Clone, block_no: int) -> str:
+        """Hash of what a read of ``block_no`` returns. Caller holds clone.lock.
+
+        Zero discards, unmapped blocks, truncated/expanded blocks and any
+        template block beyond the clone's ``template_limit`` all hash to
+        ``ZERO_HASH``; that is exactly the emptiness test a shrink needs.
+        """
+        entry = clone.blocks.get(block_no)
+        if entry is not None:
+            return entry["hash"] if entry["kind"] == "data" else ZERO_HASH
+        if (self.template_index is not None and block_no in self.template_index
+                and block_no < clone.template_limit):
+            return self.template_index[block_no]
+        return ZERO_HASH
+
+    def resize_clone(self, clone_name: str, target_count: int) -> dict[str, Any]:
+        """Grow or shrink one clone; the other clone is untouched.
+
+        Shrinking is only allowed when the whole truncated tail is logically
+        zero.  The capacity check and the commit happen under the same
+        global+clone lock a writer takes, so no same-clone write can slip in
+        between "the tail is empty" and "the new capacity is durable".
+        """
+        if isinstance(target_count, bool) or not isinstance(target_count, int):
+            raise StorageError(f"block_count must be an integer, got {target_count!r}")
+        if target_count < MIN_BLOCK_COUNT or target_count > MAX_BLOCK_COUNT:
+            raise StorageError(
+                f"block_count must be in [{MIN_BLOCK_COUNT}, {MAX_BLOCK_COUNT}], "
+                f"got {target_count}")
+        clone = self._get_clone(clone_name)
+
+        with self.global_lock:
+            with clone.lock:
+                old_count = clone.block_count
+                if target_count == old_count:
+                    return {
+                        "clone": clone_name,
+                        "block_count": old_count,
+                        "old_block_count": old_count,
+                        "changed": False,
+                    }
+
+                shrinking = target_count < old_count
+                if shrinking:
+                    for no in range(target_count, old_count):
+                        if self._logical_hash_locked(clone, no) != ZERO_HASH:
+                            raise ResizeBlockedError(clone_name, target_count, no)
+
+                new_blocks = {no: e for no, e in clone.blocks.items()
+                              if no < target_count}
+                dropped_hashes = sorted({
+                    e["hash"] for no, e in clone.blocks.items()
+                    if no >= target_count and e["kind"] == "data"})
+                # A truncated block number must stay zero forever, even if it
+                # is added back by a later grow while the template index still
+                # knows it.  Shrinking lowers the template window permanently.
+                new_limit = (min(clone.template_limit, target_count)
+                             if shrinking else clone.template_limit)
+
+                # Capacity and mapping are one atomic metadata document; if
+                # this raises, in-memory state (and thus the served capacity)
+                # still holds the old value.
+                clone._persist_state(target_count, new_blocks, new_limit)
+                clone.block_count = target_count
+                clone.blocks = new_blocks
+                clone.template_limit = new_limit
+
+                # Persisted: reclaim store files that only the truncated tail
+                # referenced. A failure here leaves a harmless orphan that the
+                # retirement GC sweep would remove later.
+                released = [h for h in dropped_hashes
+                            if self._release_if_orphaned(h)]
+
+        return {
+            "clone": clone_name,
+            "block_count": clone.block_count,
+            "old_block_count": old_count,
+            "template_limit": clone.template_limit,
+            "changed": True,
+            "released_hashes": sorted(released),
+        }
 
     # ------------------------------------------------------------- introspection
     def snapshot(self) -> dict[str, Any]:
@@ -325,6 +459,8 @@ class BlockService:
         return {
             "block_size": BLOCK_SIZE,
             "block_count": self.block_count,
+            "block_count_min": MIN_BLOCK_COUNT,
+            "block_count_max": MAX_BLOCK_COUNT,
             "template": {
                 "index_present": self.template_index is not None,
                 "index_path": str(self.template_index_path),
@@ -350,6 +486,9 @@ class BlockService:
         return {
             "name": name,
             "block_count": clone.block_count,
+            "block_size": BLOCK_SIZE,
+            "capacity_bytes": clone.block_count * BLOCK_SIZE,
+            "template_limit": clone.template_limit,
             "overwrites": overwrites,
             "discards": discards,
             "changed_blocks": len(clone.blocks),
@@ -385,13 +524,18 @@ class BlockService:
         """Kick off (or resume) background template retirement."""
         with self._ret_lock:
             state = self.retirement.get("state", "idle")
-            if state in (PHASE_MATERIALIZING, PHASE_INDEX_REMOVED, PHASE_GC_SWEEP):
-                return {"started": False, "status": dict(self.retirement),
-                        "message": "retirement already running"}
             if state == PHASE_COMPLETED:
                 return {"started": False, "status": dict(self.retirement),
                         "message": "retirement already completed"}
-            if state == PHASE_FAILED:
+            if self._worker is not None and self._worker.is_alive() and \
+                    state in (PHASE_MATERIALIZING, PHASE_INDEX_REMOVED, PHASE_GC_SWEEP):
+                return {"started": False, "status": dict(self.retirement),
+                        "message": "retirement already running"}
+            if state in (PHASE_MATERIALIZING, PHASE_INDEX_REMOVED, PHASE_GC_SWEEP):
+                # The persisted state says a run is in flight but no live
+                # worker owns it (e.g. it was stopped): resume the same run.
+                pass
+            elif state == PHASE_FAILED:
                 # Allow retrying after a failure: resume from the persisted phase.
                 self.retirement["state"] = self.retirement.get("resume_phase",
                                                                PHASE_MATERIALIZING)
@@ -476,7 +620,15 @@ class BlockService:
                     # batches; clone-local entries always win over materialization.
                     with self.global_lock:
                         with clone.lock:
+                            limit = clone.template_limit
                             for no, h in template_items[cursor:cursor + batch]:
+                                # Never write a block outside the clone's
+                                # current capacity (e.g. one that a shrink
+                                # truncated and the index still lists), and
+                                # never fill an expanded hole: only numbers
+                                # this clone may still resolve via the index.
+                                if no >= clone.block_count or no >= limit:
+                                    continue
                                 if no not in clone.blocks:
                                     clone.blocks[no] = {"kind": "data", "hash": h}
                             clone._persist()
@@ -517,11 +669,18 @@ class BlockService:
                                                     PHASE_COMPLETED):
                 return
         if self.template_index_path.exists():
-            # Safety check: every clone must cover every former template block.
+            # Safety check: every clone must cover every former template block
+            # that it can still resolve through the index. Blocks truncated by
+            # a shrink (no longer inside the clone's capacity) or blocks the
+            # clone permanently treats as zero are legitimately unmapped and
+            # must not hold retirement back.
             if self.template_index is not None:
                 for name in CLONE_NAMES:
                     clone = self.clones[name]
-                    missing = [no for no in self.template_index if no not in clone.blocks]
+                    with clone.lock:
+                        limit = min(clone.block_count, clone.template_limit)
+                        missing = [no for no in self.template_index
+                                   if no < limit and no not in clone.blocks]
                     if missing:
                         raise StorageError(
                             f"refusing to remove index: {name} missing materialized "

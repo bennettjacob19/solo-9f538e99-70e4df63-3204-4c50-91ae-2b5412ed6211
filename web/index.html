@@ -97,6 +97,7 @@
         <label>块号（block_no）</label>
         <input type="number" id="block-no" value="0" min="0" />
       </div>
+      <div class="muted" id="range-hint" style="align-self:center;flex:0 1 auto"></div>
       <div style="flex:0">
         <button id="btn-read">读取</button>
       </div>
@@ -124,6 +125,23 @@
       <span class="muted" style="align-self:center">改动只影响所选克隆盘，元数据落盘后才返回成功</span>
     </div>
     <div id="op-flash" class="flash"></div>
+
+    <hr style="border:0;border-top:1px solid var(--line);margin:16px 0" />
+    <label style="margin-top:0">在线调整容量（仅影响所选克隆盘）</label>
+    <div class="row">
+      <div>
+        <label style="margin-top:0">目标块数（1 ～ 32768，每块 4 KiB）</label>
+        <input type="number" id="resize-count" min="1" max="32768" value="32" />
+      </div>
+      <div style="flex:0">
+        <button id="btn-resize" class="secondary">调整容量</button>
+      </div>
+      <div class="muted" style="align-self:center;flex:2 1 220px">
+        扩容后的新块在写入前读零；缩容只能截去逻辑上全零的尾段，
+        遇到非零块会拒绝并报出第一个非零块号。
+      </div>
+    </div>
+    <div id="resize-flash" class="flash"></div>
   </section>
 
   <!-- 读取结果 -->
@@ -169,6 +187,13 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let snapshot = null;
+const RESIZE_MIN = 1, RESIZE_MAX = 32768;
+
+// Tracks the clone and block whose data is currently displayed, plus a
+// monotonic token so an older read that resolves late can never repaint newer
+// data (or blocks that are out of range after a shrink).
+let shownRead = null;   // {clone, blockNo}
+let readToken = 0;
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -177,8 +202,47 @@ function esc(s) {
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+  if (!r.ok) {
+    const err = new Error(body.error || ("HTTP " + r.status));
+    err.body = body;
+    err.status = r.status;
+    throw err;
+  }
   return body;
+}
+
+function cloneInfo(name) {
+  if (!snapshot) return null;
+  return snapshot.clones.find(x => x.name === name) || null;
+}
+
+function currentCapacity() {
+  const c = cloneInfo($("clone").value);
+  return c ? c.block_count : (snapshot ? snapshot.block_count : null);
+}
+
+function clearReadResult(msg) {
+  shownRead = null;
+  readToken++;  // invalidate every read still in flight
+  $("read-meta").innerHTML = `<span class="muted">${esc(msg)}</span>`;
+  $("read-hex").textContent = "—";
+}
+
+function syncRange() {
+  const cap = currentCapacity();
+  if (cap == null) return;
+  const maxNo = cap - 1;
+  const input = $("block-no");
+  input.max = maxNo;
+  input.min = 0;
+  $("range-hint").textContent = `该盘块号范围 0 ～ ${maxNo}（共 ${cap} 块）`;
+  $("resize-count").value = cap;
+  $("resize-count").min = RESIZE_MIN;
+  $("resize-count").max = RESIZE_MAX;
+  const no = parseInt(input.value, 10);
+  if (!Number.isInteger(no) || no > maxNo || no < 0) {
+    input.value = maxNo >= 0 ? Math.min(Math.max(no || 0, 0), maxNo) : 0;
+  }
 }
 
 function retBadge(st) {
@@ -215,17 +279,19 @@ function renderVol(s) {
   for (const [suffix, name] of [["a","clone-a"], ["b","clone-b"]]) {
     const c = s.clones.find(x => x.name === name);
     const ow = c.overwrites.map(n =>
-      `<span class="chip" data-no="${n}" title="覆盖块 ${n}">${n}</span>`).join("");
+      `<span class="chip" data-clone="${name}" data-no="${n}" title="覆盖块 ${n}">${n}</span>`).join("");
     const dd = c.discards.map(n =>
-      `<span class="chip discard" data-no="${n}" title="丢弃块 ${n}（读零）">${n}✕</span>`).join("");
+      `<span class="chip discard" data-clone="${name}" data-no="${n}" title="丢弃块 ${n}（读零）">${n}✕</span>`).join("");
     $("map-" + suffix).innerHTML = `
-      <div class="muted" style="margin-bottom:6px">改动块 ${c.changed_blocks} 个
-        （覆盖 ${c.overwrites.length} · 丢弃 ${c.discards.length}），点击块号可直接读取</div>
+      <div class="muted" style="margin-bottom:6px">容量 ${c.block_count} 块（${c.block_count * s.block_size} B）；
+        改动块 ${c.changed_blocks} 个（覆盖 ${c.overwrites.length} · 丢弃 ${c.discards.length}），点击块号可直接读取</div>
       <div class="chips">${ow}${dd || '<span class="muted">无改动（全部经模板索引读取）</span>'}</div>`;
   }
   document.querySelectorAll(".chip").forEach(ch => {
     ch.onclick = () => {
+      $("clone").value = ch.dataset.clone;
       $("block-no").value = ch.dataset.no;
+      syncRange();
       doRead();
     };
   });
@@ -270,8 +336,16 @@ async function refresh() {
     snapshot = await api("/api/status");
     renderVol(snapshot);
     renderRetirement(snapshot);
-    const maxNo = snapshot.block_count - 1;
-    $("block-no").max = maxNo;
+    syncRange();
+    // A shrink may have moved the displayed block out of range. Clear it
+    // immediately, and bump the token so an older in-flight read cannot
+    // repaint the truncated block when it finally resolves.
+    const cap = currentCapacity();
+    if (shownRead && cap != null) {
+      const stillThere = cloneInfo(shownRead.clone) &&
+        shownRead.blockNo < cloneInfo(shownRead.clone).block_count;
+      if (!stillThere) clearReadResult(`已调整容量：块 ${shownRead.blockNo} 已被缩掉，读取结果已清除`);
+    }
   } catch (e) {
     $("vol-status").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }
@@ -282,27 +356,59 @@ function flash(el, msg, ok) {
 }
 
 async function doRead() {
-  const name = $("clone").value, no = parseInt($("block-no").value, 10);
+  const name = $("clone").value;
+  const no = parseInt($("block-no").value, 10);
+  if (!Number.isInteger(no)) return flash($("op-flash"), "请输入有效块号", false);
+  const cap = currentCapacity();
+  if (cap != null && (no < 0 || no >= cap)) {
+    clearReadResult(`块 ${no} 超出 ${name} 的块号范围 [0, ${cap - 1}]`);
+    return flash($("op-flash"), `块号越界：${name} 当前只有 ${cap} 块`, false);
+  }
+  const token = ++readToken;
   try {
     const r = await api(`/api/clones/${name}/blocks/${no}`);
+    // Discard stale responses: a newer read/resize has superseded this one,
+    // or the block has since fallen outside the clone's capacity.
+    const info = cloneInfo(name);
+    if (token !== readToken || !info || no >= info.block_count) return;
+    shownRead = {clone: name, blockNo: no};
     const sourceText = {
       clone: "克隆盘自有块（覆盖写入）",
       template: "模板索引（未改动块）",
       zero_discard: "零（该块已被丢弃）",
-      zero_unmapped: "零（无映射）",
+      zero_unmapped: "零（无映射 / 扩容后未写入）",
     }[r.source];
     $("read-meta").innerHTML = [
+      ["克隆盘 / 块号", `${name} / ${no}`],
       ["来源", `<span class="tag ${r.source}">${r.source}</span> ${sourceText}`],
       ["引用", r.ref || "—"],
       ["sha256", r.sha256],
       ["ASCII 预览", esc(r.preview_ascii)],
     ].map(([k, v]) => `<div class="k">${k}</div><div class="mono">${v}</div>`).join("");
     $("read-hex").textContent = r.data_hex.slice(0, 512) + (r.data_hex.length > 512 ? " …（截断）" : "");
-  } catch (e) { flash($("op-flash"), "读取失败：" + e.message, false); }
+  } catch (e) {
+    if (token !== readToken) return;  // superseded; do not surface stale errors
+    clearReadResult(`读取失败：${e.message}`);
+    flash($("op-flash"), "读取失败：" + e.message, false);
+  }
+}
+
+function inRangeOrFlash(name, no) {
+  const info = cloneInfo(name);
+  if (info && (no < 0 || no >= info.block_count)) {
+    flash($("op-flash"), `块号越界：${name} 当前容量 ${info.block_count} 块（0 ～ ${info.block_count - 1}）`, false);
+    return false;
+  }
+  if (!Number.isInteger(no)) {
+    flash($("op-flash"), "请输入有效块号", false);
+    return false;
+  }
+  return true;
 }
 
 async function doWrite() {
   const name = $("clone").value, no = parseInt($("block-no").value, 10);
+  if (!inRangeOrFlash(name, no)) return;
   const hex = $("hex-input").value.trim();
   const pattern = $("pattern").value;
   const body = hex ? {data_hex: hex} : (pattern ? {pattern} : null);
@@ -317,6 +423,7 @@ async function doWrite() {
 
 async function doDiscard() {
   const name = $("clone").value, no = parseInt($("block-no").value, 10);
+  if (!inRangeOrFlash(name, no)) return;
   if (!confirm(`确认丢弃 ${name} 的块 ${no}？丢弃后读取返回全零。`)) return;
   try {
     await api(`/api/clones/${name}/blocks/${no}`, {method: "DELETE"});
@@ -325,9 +432,47 @@ async function doDiscard() {
   } catch (e) { flash($("op-flash"), "丢弃失败：" + e.message, false); }
 }
 
+async function doResize() {
+  const name = $("clone").value;
+  const target = parseInt($("resize-count").value, 10);
+  const flashEl = $("resize-flash");
+  if (!Number.isInteger(target) || target < RESIZE_MIN || target > RESIZE_MAX) {
+    return flash(flashEl, `目标块数必须是 ${RESIZE_MIN} ～ ${RESIZE_MAX} 的整数`, false);
+  }
+  const before = currentCapacity();
+  if (target < (before ?? Infinity) &&
+      !confirm(`确认把 ${name} 从 ${before} 块缩容到 ${target} 块？\n只能截去逻辑上全零的尾段，否则会被拒绝。`)) {
+    return;
+  }
+  try {
+    const r = await api(`/api/clones/${name}/capacity`, {
+      method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({block_count: target})});
+    const direction = r.block_count >= r.old_block_count ? "扩容" : "缩容";
+    flash(flashEl, `${direction}成功：${name} ${r.old_block_count} → ${r.block_count} 块（${r.block_count * 4096} B）`, true);
+    // New capacity takes effect immediately; drop any now-out-of-range read
+    // result before the periodic refresh can repaint it.
+    await refresh();
+    const no = parseInt($("block-no").value, 10);
+    if (!Number.isInteger(no) || no >= r.block_count) {
+      clearReadResult(`块 ${no} 已被缩掉（当前容量 ${r.block_count} 块）`);
+    }
+  } catch (e) {
+    const b = e.body || {};
+    if (b.first_nonzero_block !== undefined) {
+      flash(flashEl,
+        `缩容被拒绝：目标 ${target} 块的尾段含非零块，第一个非零块号是 ${b.first_nonzero_block}`, false);
+    } else {
+      flash(flashEl, "调整失败：" + e.message, false);
+    }
+  }
+}
+
 $("btn-read").onclick = doRead;
 $("btn-write").onclick = doWrite;
 $("btn-discard").onclick = doDiscard;
+$("btn-resize").onclick = doResize;
+$("clone").onchange = () => { syncRange(); clearReadResult("已切换克隆盘"); };
 $("btn-refresh").onclick = refresh;
 $("btn-retire").onclick = async () => {
   try {

@@ -12,7 +12,10 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .storage import BLOCK_SIZE, CLONE_NAMES, BlockService, StorageError
+from .storage import (
+    BLOCK_SIZE, CLONE_NAMES, MAX_BLOCK_COUNT, MIN_BLOCK_COUNT, BlockService,
+    ResizeBlockedError, StorageError,
+)
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 BLOCK_COUNT = int(os.environ.get("BLOCK_COUNT", "32"))
@@ -39,6 +42,14 @@ app = FastAPI(title="Local Block Storage Drill", version="1.0.0", lifespan=lifes
 
 @app.exception_handler(StorageError)
 async def storage_error_handler(request: Request, exc: StorageError) -> JSONResponse:
+    if isinstance(exc, ResizeBlockedError):
+        return JSONResponse(status_code=409, content={
+            "error": str(exc),
+            "code": "tail_not_zero",
+            "clone": exc.clone_name,
+            "first_nonzero_block": exc.block_no,
+            "target_block_count": exc.target_count,
+        })
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
@@ -53,6 +64,12 @@ class BlockWrite(BaseModel):
     pattern: str | None = Field(
         default=None,
         description="optional fill pattern: 'zero', 'ones' or a short ASCII string",
+    )
+
+
+class ResizeRequest(BaseModel):
+    block_count: int = Field(
+        description=f"new block count in [{MIN_BLOCK_COUNT}, {MAX_BLOCK_COUNT}]"
     )
 
 
@@ -109,7 +126,16 @@ async def status() -> dict:
 
 @app.get("/api/clones")
 async def list_clones() -> dict:
-    return {"clones": CLONE_NAMES, "block_count": svc().block_count, "block_size": BLOCK_SIZE}
+    return {
+        "clones": [
+            {"name": name, "block_count": svc().clones[name].block_count}
+            for name in CLONE_NAMES
+        ],
+        "block_count": svc().block_count,
+        "block_size": BLOCK_SIZE,
+        "block_count_min": MIN_BLOCK_COUNT,
+        "block_count_max": MAX_BLOCK_COUNT,
+    }
 
 
 @app.get("/api/clones/{name}/blocks/{block_no}")
@@ -128,6 +154,13 @@ async def overwrite_clone_block(name: str, block_no: int, body: BlockWrite) -> d
 async def discard_clone_block(name: str, block_no: int) -> dict:
     result = svc().discard_block(name, block_no)
     return {"ok": True, "operation": "discard", **result}
+
+
+@app.put("/api/clones/{name}/capacity")
+async def resize_clone(name: str, body: ResizeRequest) -> dict:
+    """Online resize of a single clone; its blocks/other clone are unaffected."""
+    result = svc().resize_clone(name, body.block_count)
+    return {"ok": True, "operation": "resize", **result}
 
 
 @app.get("/api/template/blocks/{block_no}")
